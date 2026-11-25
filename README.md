@@ -1,87 +1,226 @@
 # OREMETRIX
 
-Protótipo de **medição online da umidade de minério de ferro** (TCC SENAI, demanda da Vale S/A).
-ESP32 + sensor capacitivo + DS18B20 → API Next.js → SQLite → painel web.
+Protótipo de **medição online da umidade de minério de ferro** para TCC do SENAI (demanda da Vale S/A).
+Substitui a coleta manual de amostras com resultado tardio por medição contínua em pilhas e correias transportadoras, com envio em tempo real via HTTP para painel web e alertas automáticos.
 
-> **Isto é um protótipo em escala, não uma solução industrial.** O sistema funciona sem hardware,
-> usando um simulador. Todo dado simulado é marcado como `simulated` na API e deve aparecer com a
-> etiqueta **SIMULADO** na interface. Nunca apresente dado simulado como medição real.
+> **Regra de honestidade — Protótipo em escala:** este projeto usa **ESP32 + sensor de umidade capacitivo analógico + DS18B20** e **não é uma solução industrial**. O sistema também funciona sem hardware por meio de um simulador (`scripts/simulator.ts`). Todo dado gerado pelo simulador é marcado com `simulated: true` e exibido na interface com a etiqueta visível **SIMULADO**. Nunca apresente dados simulados como medições reais.
+
+---
 
 ## Status da entrega
 
 | Etapa | Conteúdo | Situação |
 |---|---|---|
-| 1 | Backend + banco + testes da calibração | **pronta** |
-| 2 | Simulador (`npm run sim`) | pendente |
-| 3 | Painel (Painel, Calibração, Histórico, Configurações) | pendente |
-| 4 | Firmware ESP32 | pendente |
-| 5 | README final e revisão | pendente |
+| 1 | Backend Next.js + SQLite (`better-sqlite3`) + testes de calibração e API | **Implementada e testada** (`25/25` testes passando) |
+| 2 | Simulador (`scripts/simulator.ts` e `scripts/seed.ts`) | **Implementada** (não executada ponta a ponta neste ambiente) |
+| 3 | Painel web em pt-BR (Painel, Histórico, Calibração, Configurações) | **Implementada** (com erro pendente em `typecheck`; UI não validada no navegador) |
+| 4 | Firmware ESP32 (`firmware/`, PlatformIO / Arduino) | **Implementada** (`pio run` não executado; PlatformIO não instalado no ambiente) |
+| 5 | `README.md` final e revisão | **Concluída** |
 
-## Como rodar (etapa 1)
+---
+
+## Arquitetura do repositório
+
+```text
+.
+├── firmware/
+│   ├── platformio.ini             # Configuração PlatformIO (esp32dev, Arduino)
+│   ├── include/secrets.h.example  # Modelo de credenciais Wi-Fi e API Key (nunca commitar secrets.h)
+│   └── src/
+│       ├── config.h               # Pinos, filtragem, calibração padrão, URL e IDs
+│       └── main.cpp               # Leitura ADC + DS18B20, mediana + EMA, Preferences, fila offline e HTTP
+├── scripts/
+│   ├── seed.ts                    # Inicializa data/oremetrix.db com os 3 pontos de exemplo
+│   └── simulator.ts               # Simulador de 3 cenários (estável, deriva, ruidoso)
+├── src/
+│   ├── app/
+│   │   ├── page.tsx               # Tela Painel (cards, faixa de alertas, gráficos Recharts)
+│   │   ├── historico/page.tsx     # Tela Histórico (filtros por ponto/período e exportação CSV)
+│   │   ├── calibracao/page.tsx    # Tela Calibração (regressão linear, gráfico de dispersão e aplicação)
+│   │   ├── configuracoes/page.tsx # Tela Configurações (status do simulador, chave de API, limites)
+│   │   └── api/                   # Rotas App Router (readings, config, points, calibration, alerts, settings)
+│   ├── components/                # Navbar, PointCard, MoistureChart, AlertBar, SimulatedBadge, StatusDot
+│   ├── hooks/usePolling.ts        # Hook de polling automático para o painel
+│   └── lib/                       # Banco SQLite, schema, repositório, validação Zod, calibração, alertas
+├── tests/                         # Testes unitários e de handlers da API (calibration.test.ts, api.test.ts)
+└── data/                          # Diretório onde data/oremetrix.db é criado em tempo de execução
+```
+
+Identidade visual configurada em `tailwind.config.js`, `src/app/globals.css` e `src/app/layout.tsx`: fundo azul-marinho `#0b1f3a`, destaque verde `#22c55e`, tipografia `Space Grotesk` (títulos) e `Inter` (corpo).
+
+---
+
+## Como rodar
+
+### Pré-requisitos
+
+- **Node.js `>= 20.9`** (testado com Node `v26.13.1` e npm `11.20.0`).
+- Em Windows com PowerShell onde `npm.ps1` esteja bloqueado pela ExecutionPolicy, utilize `npm.cmd` ou `cmd /c "npm ..."`.
+
+### 1. Instalar dependências e rodar testes
 
 ```bash
 npm install
-npm test        # 25 testes: calibração + API
-npm run dev     # http://localhost:3000 — cria data/oremetrix.db com 3 pontos de exemplo
+npm test
 ```
 
-Requer Node 20.9+ (os testes usam `better-sqlite3`; se ele não estiver instalado, caem para o
-`node:sqlite`, que exige Node 22.5+).
+> **Nota sobre scripts nativos (`better-sqlite3`):** caso o npm exiba aviso de `allowScripts`, aprove os scripts de compilação com `npm install-scripts approve better-sqlite3 esbuild`.
 
-Na primeira execução é gerada uma **chave de API aleatória**, guardada só no banco local
-(`settings.api_key`). Ela não está no repositório. Para ver a chave durante a etapa 1:
+### 2. Subir o painel e o backend
 
 ```bash
-sqlite3 data/oremetrix.db "select value from settings where key='api_key'"
+npm run dev
 ```
 
-(Na etapa 3 ela aparece na tela Configurações.)
+Acesse **http://localhost:3000**.
 
-## API
+- Na primeira execução (ao inicializar a conexão em `src/lib/db.ts`), o banco `data/oremetrix.db` é criado automaticamente com:
+  - **3 pontos de exemplo:** `P-01` ("Pilha 1", `esp32-p01`), `P-03` ("Pilha 2", `esp32-p03`) e `C-01` ("Correia 1", `esp32-c01`), todos com limite padrão `9,0%` e calibração ilustrativa (`a = -0,005`, `b = 20`).
+  - **Chave de API aleatória:** gerada e salva apenas no banco local (`settings.api_key`). Ela pode ser visualizada e copiada na tela **Configurações** (`/configuracoes`).
+- Se quiser inicializar o banco manualmente antes de rodar o simulador (sem abrir o painel antes), execute:
 
-| Método e rota | Chave `x-api-key` | O que faz |
+```bash
+npm run db:seed
+```
+
+### 3. Rodar o simulador (sem hardware)
+
+Em outro terminal, com `npm run dev` ativo (e o banco já criado):
+
+```bash
+npm run sim
+```
+
+Opções disponíveis (implementadas em `scripts/simulator.ts`):
+
+```bash
+npm run sim:fast                     # reduz o intervalo de 2 s para 500 ms
+npm run sim:alert                    # ponto P-03 inicia em 8,0% com deriva rápida até cruzar 9,0%
+npm run sim -- --fast --scenario=alert
+```
+
+Comportamento simulado para os 3 pontos (todos marcados com `simulated: true` e exibidos com o selo **SIMULADO**):
+
+- **`P-01` (estável):** oscila levemente em torno de `7,0%`.
+- **`P-03` (deriva):** sobe gradualmente (taxa maior em `--scenario=alert`), ultrapassa `9,0%` (disparando alerta após 3 leituras consecutivas acima do limite) e depois retorna abaixo do limite.
+- **`C-01` (ruidoso):** oscila com ruído alto em torno de `8,0%`.
+
+---
+
+## Como ligar o hardware (ESP32)
+
+### Esquema de ligação (texto)
+
+Os pinos são configurados em `firmware/src/config.h`:
+- `PIN_MOISTURE_ADC`: **`GPIO34`** (`ADC1_CH6` — escolhido por ser do ADC1, que não conflita com o Wi-Fi do ESP32).
+- `PIN_DS18B20`: **`GPIO4`** (barramento OneWire).
+
+```text
+                   +-----------------------+
+                   |         ESP32         |
+                   |                       |
+   Sensor          |                       |        DS18B20 (Temperatura)
+ Capacitivo        |                       |      +-----------------------+
++----------+       |                       |      |                       |
+| VCC  ----+------>| 3V3               3V3 |<-----+ VCC (vermelho)        |
+| GND  ----+------>| GND               GND |<-----+ GND (preto)           |
+| AOUT ----+------>| GPIO34          GPIO4 |<--+--+ DQ  (amarelo/branco)  |
++----------+       |                       |   |  |                       |
+                   +-----------------------+   |  +-----------------------+
+                                               |
+                                          [Resistor 4,7 kΩ]
+                                               |
+                                              3V3
+```
+
+> **Atenção:** alimente o sensor capacitivo com **3,3 V** (ou use divisor resistivo na saída analógica caso seu módulo opere exclusivamente em 5 V), pois o ADC do ESP32 suporta no máximo **3,3 V** no `GPIO34`. O firmware configura resolução de 12 bits (`0–4095`) e atenuação `ADC_11db`.
+
+### Compilação e gravação do firmware (PlatformIO)
+
+1. Copie `firmware/include/secrets.h.example` para `firmware/include/secrets.h` (o `.gitignore` impede que `secrets.h` seja versionado).
+2. Preencha `WIFI_SSID`, `WIFI_PASSWORD` e `API_KEY` (copie a chave gerada pelo backend na tela **Configurações** do painel).
+3. Em `firmware/src/config.h`, ajuste `SERVER_URL` para o IP da máquina que executa o Next.js na rede local (ex.: `http://192.168.1.100:3000`) e confira `DEVICE_ID` / `POINT_ID`.
+4. Compile (sem precisar de placa conectada) ou grave na placa dentro da pasta `firmware/`:
+
+```bash
+cd firmware
+pio run                  # compila o firmware
+pio run --target upload  # grava no ESP32 conectado via USB
+pio device monitor -b 115200
+```
+
+### Funcionamento do firmware (`firmware/src/main.cpp`)
+
+- Coleta **15 amostras** (`MEDIAN_SAMPLES`) do ADC, extrai a **mediana** e aplica **média móvel exponencial** (`EMA_ALPHA = 0.2f`).
+- Calcula `umidade_% = a * leitura_filtrada + b` (limitada a `0–100%`) e lê o DS18B20.
+- Envia `POST /api/readings` a cada **5 s** (`SEND_INTERVAL_MS = 5000`) com header `x-api-key`.
+- Reconecta automaticamente ao Wi-Fi e mantém uma fila circular em RAM (`QUEUE_MAX_SIZE = 20`) para reenviar leituras perdidas durante quedas de conexão.
+- Consulta `GET /api/config/:deviceId` na inicialização e a cada **60 s**, persistindo `a` e `b` em memória não volátil (`Preferences`, namespace `"oremetrix"`).
+
+---
+
+## Como calibrar o sensor
+
+Os coeficientes padrão de primeiro boot (`a = -0,005`, `b = 20`) são **apenas ilustrativos**. Para calibração em bancada com minério real:
+
+1. Prepare amostras de minério em diferentes faixas de umidade (recomendado **5 ou mais amostras** distribuídas na faixa de operação; o mínimo aceito pela API é **3**).
+2. Registre a leitura bruta filtrada (`raw`, de `0` a `4095`) estabilizada no sensor para cada amostra e obtenha a umidade real (%) em estufa (método gravimétrico).
+3. No painel web, acesse **Calibração** (`/calibracao`), selecione o ponto (ex.: `P-03`), insira os pares `(leitura bruta, umidade real %)` e clique em **Calcular Regressão**.
+4. Analise os valores calculados de `a`, `b`, o coeficiente de determinação `R²` e o gráfico de dispersão com a reta ajustada. O sistema emite avisos se `R² < 0,95` ou se houver menos de 5 pares.
+5. Clique em **Aplicar ao `<ponto>`** (`POST /api/calibration/:id/apply`). Os novos coeficientes são gravados no ponto e enviados ao ESP32 na próxima busca de `GET /api/config/:deviceId`.
+
+---
+
+## API do Backend
+
+| Método e rota | Header `x-api-key` | Descrição |
 |---|---|---|
-| `POST /api/readings` | sim | Valida (zod), grava a leitura e avalia alertas |
-| `GET /api/readings?pointId=&from=&to=&limit=&order=` | não | Histórico. `from`/`to` em epoch ms ou ISO 8601; `limit` 1–10000 (padrão 500, pega as **mais recentes**); `order` asc (padrão) ou desc |
-| `GET /api/config/:deviceId` | sim | `{a, b, limit}` do ponto do dispositivo |
-| `PUT /api/points/:id` | não | Altera `name` e/ou `limit` (padrão 9,0 %) |
-| `POST /api/calibration` | não | 3+ pares `{raw, moisture}` → `a`, `b`, `R²`; **salva** o registro |
-| `GET /api/points` | não | *(extra)* pontos com última leitura, margem e status |
-| `GET /api/alerts?active=1&pointId=` | não | *(extra)* alertas |
-| `GET /api/calibration?pointId=` | não | *(extra)* histórico de calibrações |
-| `POST /api/calibration/:id/apply` | não | *(extra)* aplica a calibração salva ao ponto |
+| `POST /api/readings` | Sim | Valida payload (`zod`), autentica chave, grava leitura e avalia regra de alerta |
+| `GET /api/readings?pointId=&from=&to=&limit=&order=` | Não | Consulta histórico (`from`/`to` em epoch ms ou ISO 8601; `limit` 1–10000, padrão 500; `order` `asc` ou `desc`) |
+| `GET /api/config/:deviceId` | Sim | Retorna `{ a, b, limit }` vigentes para o dispositivo |
+| `GET /api/points` | Não | Lista pontos com última leitura, margem (`limit - moisture`), `alertOpen` e `status` |
+| `PUT /api/points/:id` | Não | Atualiza `name` e/ou `limit` (padrão `9,0%`) |
+| `POST /api/calibration` | Não | Calcula regressão linear (mín. 3 pares), retorna `a`, `b`, `R²`, `warnings` e salva o registro |
+| `GET /api/calibration?pointId=` | Não | Lista histórico de calibrações |
+| `POST /api/calibration/:id/apply` | Não | Aplica os coeficientes salvos ao ponto correspondente |
+| `GET /api/alerts?active=1&pointId=&limit=` | Não | Lista alertas abertos ou históricos |
+| `GET /api/settings/api-key` | Não | Retorna a chave de API local para exibição na tela Configurações |
 
-Payload de `POST /api/readings`:
-
-```json
-{ "deviceId": "esp32-p03", "pointId": "P-03", "raw": 2200.4, "tempC": 24.5,
-  "moisture": 9.0, "ts": 1800000000000, "simulated": false }
-```
-
-Pontos de exemplo: `P-01` Pilha 1 (`esp32-p01`), `P-03` Pilha 2 (`esp32-p03`), `C-01` Correia 1 (`esp32-c01`).
+---
 
 ## Decisões tomadas
 
-1. **Chave de API** gerada na 1ª execução e guardada no SQLite (não em arquivo versionado). O simulador (etapa 2) a lê do mesmo banco.
-2. **Campo extra `simulated`** (opcional, padrão `false`) no payload, para sustentar a etiqueta SIMULADO. O firmware real não precisa enviá-lo; o simulador sempre envia `true`.
-3. **`raw`** é a leitura *já filtrada* (mediana de 15 + média móvel exponencial), a mesma usada na conta `umidade = a·raw + b`. O servidor guarda `moisture` como veio do dispositivo (não recalcula).
-4. **`ts`** em milissegundos. Se for anterior a 2020 (relógio sem NTP) ou mais de 10 min no futuro, o servidor usa o próprio horário e informa `tsSource: "servidor"`.
-5. **`deviceId` deve corresponder ao ponto** (`409` se não bater; `404` se o ponto não existir).
-6. **Alerta:** abre com 3 leituras seguidas `> limite` (exatamente no limite não conta); fecha com 3 seguidas `≤ limite`; no máximo 1 alerta aberto por ponto; usa o limite vigente. O alerta herda a etiqueta `simulated` da leitura que o disparou.
-7. **Status do card:** `alerta` (alerta aberto) › `atencao` (umidade > 90 % do limite, ou acima do limite sem 3 seguidas) › `ok`; `sem_dados` se nunca houve leitura.
-8. **Calibração em dois passos:** `POST /api/calibration` calcula e salva; aplicar ao ponto é uma ação explícita (botão na tela, etapa 3). Aplicar **não recalcula** o histórico. Há avisos para R² < 0,95 e para menos de 5 pares (o mínimo aceito é 3).
-9. **Calibração padrão do 1º boot:** `a = -0,005`, `b = 20` (sensor capacitivo: mais úmido → leitura menor). Valores **ilustrativos**, não validados com minério — é obrigatório calibrar com amostras de estufa.
-10. **Mensagens de validação do zod** ficam em inglês (campo `issues` da resposta); as mensagens próprias da API estão em português.
+Quando faltou especificação explícita, foram adotadas as opções mais simples e registradas abaixo:
 
-## Limitações conhecidas (até aqui)
+1. **Chave de API no SQLite:** gerada aleatoriamente no 1º boot (`randomBytes(24).toString("hex")`) e guardada na tabela `settings` (nunca em arquivo versionado). O simulador lê a chave direto do banco local e a tela Configurações a exibe via `GET /api/settings/api-key`.
+2. **Identificação explícita de simulação (`simulated`):** campo booleano opcional (padrão `false`) em `POST /api/readings`. O firmware real não precisa enviá-lo; o simulador sempre envia `simulated: true`, e alertas herdam essa marcação.
+3. **Filtragem no ESP32 e persistência do valor reportado:** `raw` enviado no payload corresponde ao valor **já filtrado** (mediana de 15 + EMA α=0,2) usado no cálculo de `moisture`. O servidor persiste `moisture` como recebido.
+4. **Normalização de timestamp (`ts`):** esperado em epoch ms; se `ts` vier antes de 01/01/2020 (ESP32 sem NTP) ou mais de 10 min no futuro, o servidor substitui pelo horário do servidor e informa `tsSource: "servidor"`. Como o `main.cpp` não chama `configTime()` explícito, na configuração padrão o servidor assume o timestamp corretamente.
+5. **Vínculo ponto ↔ dispositivo:** `POST /api/readings` exige que `deviceId` corresponda ao `pointId` cadastrado (`409` se divergir; `404` se o ponto não existir).
+6. **Histerese de alertas (anti falso alarme):** um alerta só abre após **3 leituras seguidas** estritamente `> limite` (valor exato no limite não abre), e só é resolvido após **3 leituras seguidas** `<= limite`. Há no máximo 1 alerta aberto por ponto.
+7. **Status do card:** `alerta` (alerta aberto) > `atencao` (umidade `> 90%` do limite ou acima do limite antes de completar 3 leituras) > `ok`; `sem_dados` quando não há leituras.
+8. **Calibração em duas etapas:** `POST /api/calibration` calcula e registra a regressão; a aplicação ao ponto (`POST /api/calibration/:id/apply`) é explícita e **não recalcula** leituras passadas.
+9. **Simulador desacoplado do gerenciador de processos Web:** a tela **Configurações** detecta automaticamente se há leituras simuladas recentes (últimos 15 s) para indicar status ativo/inativo e instrui a execução via CLI (`npm run sim` / `npm run sim:alert`), evitando gerenciar processos filhos a partir das rotas Next.js.
+10. **Coeficientes no simulador:** `scripts/simulator.ts` usa coeficientes ilustrativos fixos (`a = -0,005`, `b = 20`) para gerar valores coerentes de `raw` e `moisture` nos 3 perfis de teste.
 
-- **Sem login no painel:** as rotas usadas pelo painel (`PUT /api/points`, `POST /api/calibration`, etc.) são abertas, e a chave de API ficará visível em Configurações. Uso local/rede interna apenas — **não exponha à internet**.
-- Calibração linear única por ponto; sem compensação por temperatura nem por tipo de minério.
-- Sem rotina de limpeza/retenção de leituras antigas.
-- Nenhum valor foi validado com sensor real ou minério real.
+---
 
-## O que foi (e o que não foi) verificado nesta etapa
+## Limitações conhecidas e o que ficou de fora
 
-- ✅ `npm test`: 25/25 passando — regressão linear com valores conferidos à mão (a, b, R²), autenticação, validação, filtros, regra dos 3 alertas seguidos, configuração, calibração e aplicação.
-- ✅ `tsc` sem erros de tipo no código do projeto.
-- ⚠️ **Não executado:** `npm install`, `next dev` e `better-sqlite3`. O ambiente onde a etapa foi construída não tinha acesso à internet. A lógica foi testada chamando os handlers diretamente (com `Request`/`Response` padrão) sobre um banco em memória via `node:sqlite`; a camada `src/lib/db.ts` (better-sqlite3) e os arquivos `src/app/api/**/route.ts` são finos e **ainda precisam do primeiro `npm run dev` real** para serem confirmados.
+- **Erro de TypeScript pendente no frontend (`npm run typecheck`):** `src/hooks/usePolling.ts` (linha 12) utiliza `useRef<ReturnType<typeof setTimeout>>()` sem argumento inicial, gerando erro `TS2554` sob React 19 (`Expected 1 arguments, but got 0`). Isso impede `npm run typecheck` e `npm run build` até ser ajustado para `useRef<ReturnType<typeof setTimeout> | undefined>(undefined)`.
+- **Botão interativo ligar/desligar simulador na tela Configurações:** o painel exibe o status do simulador e os comandos de terminal, mas **não possui** botão que inicie/encerre o processo `simulator.ts` diretamente pelo navegador.
+- **Compilação do firmware não verificada neste ambiente:** o `pio` (PlatformIO CLI) não está instalado nesta máquina, portanto `pio run` ainda precisa ser executado em um ambiente com PlatformIO para confirmar a compilação.
+- **Timestamp no ESP32 (`main.cpp`):** não há sincronização NTP (`configTime`) configurada no `setup()`, e a variável `tsMs` usa `unsigned long` (32 bits no ESP32), o que causaria overflow se um epoch em ms estivesse ativo; atualmente depende da correção automática de timestamp no servidor (`normalizeTs`).
+- **Sem autenticação no painel web:** rotas administrativas (`PUT /api/points/:id`, `POST /api/calibration`, `GET /api/settings/api-key`) são abertas. Uso exclusivo em rede local/bancada — **não expor à internet**.
+- **Modelo físico simplificado:** calibração linear simples por ponto, sem compensação automática por temperatura (o DS18B20 apenas registra/exibe °C), sem validação com minério real e sem rotina automática de retenção/limpeza de dados antigos no SQLite.
+- **Simulador não sincroniza calibração remota:** se a calibração de um ponto for alterada na interface, `scripts/simulator.ts` continua usando `a = -0,005` e `b = 20`.
+- **Segredos:** verificado que nenhum arquivo sensível (`.env`, `.env.local`, `data/*.db`, `firmware/include/secrets.h`) está presente no repositório.
+
+---
+
+## O que foi (e o que não foi) verificado
+
+- ✅ **`npm test`:** **25/25 testes passando** (`tests/calibration.test.ts` e `tests/api.test.ts` executados com `tsx --test` após instalação das dependências).
+- ✅ **Inicialização do servidor (`npm run dev`):** subiu em `http://localhost:3000` (`Ready in 4.7s`, Next.js 15.5.29).
+- ❌ **`npm run typecheck`:** falhou em `src/hooks/usePolling.ts(12,22)` (`TS2554`).
+- ⚠️ **Não executado / não verificado nesta máquina:** `npm run build`, testes visuais das páginas no navegador (acesso a `localhost:3000` não autorizado na sessão), execução ponta a ponta de `npm run sim` / `npm run sim:alert` junto ao servidor e compilação do firmware via `pio run` (PlatformIO ausente).
