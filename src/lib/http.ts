@@ -52,3 +52,10 @@ export function parseInstant(v: string): number | null {
   const t = Date.parse(v);
   return Number.isNaN(t) ? null : t;
 }
+
+/** Aceita só requisições feitas no próprio computador (Host = localhost). Não é autenticação: é uma trava mínima. */
+export function isLocalRequest(req: Request): boolean {
+  const host = (req.headers.get("host") ?? new URL(req.url).host).toLowerCase();
+  const name = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.split(":")[0];
+  return name === "localhost" || name === "127.0.0.1" || name === "[::1]";
+}

@@ -292,3 +292,24 @@ test("calibração: menos de 3 pares, dados degenerados e ponto/id inexistentes"
   assert.equal((await applyCalibration(db, "999")).status, 404);
   assert.equal((await applyCalibration(db, "abc")).status, 422);
 });
+
+test("aplicar calibração com R² baixo exige force=1 (evita calibrar o ponto com lixo)", async () => {
+  const { db, key } = setup();
+  const bad = [
+    { raw: 2000, moisture: 10 },
+    { raw: 2410, moisture: 8 },
+    { raw: 2810, moisture: 64 },
+  ];
+  const cal = await body(await postCalibration(req("POST", "/api/calibration", { body: { pointId: "P-03", pairs: bad } }), db, NOW));
+  assert.ok(cal.r2 < 0.95);
+
+  const denied = await applyCalibration(db, String(cal.id), NOW + 1);
+  assert.equal(denied.status, 409);
+  assert.equal((await body(denied)).error, "r2_baixo");
+  // nada mudou no ponto
+  assert.equal((await body(await getDeviceConfig(req("GET", "/x", { key }), db, "esp32-p03"))).a, DEFAULT_CAL.a);
+
+  const forced = await applyCalibration(db, String(cal.id), NOW + 2, true);
+  assert.equal(forced.status, 200);
+  assert.ok((await body(await getDeviceConfig(req("GET", "/x", { key }), db, "esp32-p03"))).a > 0);
+});

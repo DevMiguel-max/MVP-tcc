@@ -34,8 +34,7 @@
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.16",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "typescript": "^5.6.0"
   },
   "allowScripts": {
     "esbuild@0.28.2": true,

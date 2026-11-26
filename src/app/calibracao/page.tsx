@@ -18,9 +18,50 @@ interface PointOption {
   name: string;
 }
 
+/** Os campos ficam como texto para o usuário poder apagar e redigitar (inputs numéricos controlados travam em ""). */
+interface PairInput {
+  raw: string;
+  moisture: string;
+}
+
 interface Pair {
   raw: number;
   moisture: number;
+}
+
+const MIN_R2_TO_APPLY = 0.95;
+
+const fmtSigned = (n: number, digits: number) => `${n < 0 ? "−" : "+"} ${Math.abs(n).toFixed(digits)}`;
+const equation = (a: number, b: number) => `y = ${a.toFixed(6)}x ${fmtSigned(b, 4)}`;
+
+const toNumber = (v: string): number | null => {
+  const n = Number(v.replace(",", "."));
+  return v.trim() !== "" && Number.isFinite(n) ? n : null;
+};
+
+/** Domínio "bonito" e reta ajustada recortada à área visível (sem sair do gráfico nem ficar abaixo de 0%). */
+function buildChart(pairs: Pair[], fit: { a: number; b: number } | null) {
+  const raws = pairs.map((p) => p.raw);
+  const ms = pairs.map((p) => p.moisture);
+  const xMin = Math.max(0, Math.floor((Math.min(...raws) - 100) / 100) * 100);
+  const xMax = Math.min(4095, Math.ceil((Math.max(...raws) + 100) / 100) * 100);
+  const yMax = Math.max(10, Math.ceil((Math.max(...ms) * 1.15) / 5) * 5);
+
+  let line: { raw: number; fit: number }[] = [];
+  if (fit && Math.abs(fit.a) > 1e-12) {
+    const candidates = [xMin, xMax, (0 - fit.b) / fit.a, (yMax - fit.b) / fit.a]
+      .filter((x) => x >= xMin - 1e-9 && x <= xMax + 1e-9)
+      .map((x) => ({ raw: x, fit: fit.a * x + fit.b }))
+      .filter((pt) => pt.fit >= -1e-9 && pt.fit <= yMax + 1e-9)
+      .sort((p, q) => p.raw - q.raw);
+    if (candidates.length >= 2) line = [candidates[0], candidates[candidates.length - 1]];
+  } else if (fit) {
+    line = [
+      { raw: xMin, fit: fit.b },
+      { raw: xMax, fit: fit.b },
+    ].filter((pt) => pt.fit >= 0 && pt.fit <= yMax);
+  }
+  return { xDomain: [xMin, xMax] as [number, number], yDomain: [0, yMax] as [number, number], line };
 }
 
 interface CalResult {
@@ -36,10 +77,10 @@ interface CalResult {
 export default function CalibracaoPage() {
   const [points, setPoints] = useState<PointOption[]>([]);
   const [selectedPoint, setSelectedPoint] = useState("P-03");
-  const [pairs, setPairs] = useState<Pair[]>([
-    { raw: 2800, moisture: 6.0 },
-    { raw: 2400, moisture: 8.0 },
-    { raw: 2000, moisture: 10.0 },
+  const [pairs, setPairs] = useState<PairInput[]>([
+    { raw: "2800", moisture: "6.0" },
+    { raw: "2400", moisture: "8.0" },
+    { raw: "2000", moisture: "10.0" },
   ]);
   const [result, setResult] = useState<CalResult | null>(null);
   const [applying, setApplying] = useState(false);
@@ -52,18 +93,35 @@ export default function CalibracaoPage() {
       .catch(() => {});
   }, []);
 
-  const addPair = () => setPairs([...pairs, { raw: 0, moisture: 0 }]);
+  // Qualquer edição invalida o resultado anterior (senão o gráfico mostraria uma reta que não bate com os dados).
+  const resetResult = () => {
+    setResult(null);
+    setMessage(null);
+  };
+
+  const addPair = () => {
+    setPairs([...pairs, { raw: "", moisture: "" }]);
+    resetResult();
+  };
 
   const removePair = (i: number) => {
     if (pairs.length <= 3) return;
     setPairs(pairs.filter((_, idx) => idx !== i));
+    resetResult();
   };
 
-  const updatePair = (i: number, field: keyof Pair, value: string) => {
-    const v = parseFloat(value);
-    if (isNaN(v)) return;
-    setPairs(pairs.map((p, idx) => (idx === i ? { ...p, [field]: v } : p)));
+  const updatePair = (i: number, field: keyof PairInput, value: string) => {
+    setPairs(pairs.map((p, idx) => (idx === i ? { ...p, [field]: value } : p)));
+    resetResult();
   };
+
+  // Só pares completos e válidos entram no cálculo e no gráfico.
+  const validPairs: Pair[] = pairs.flatMap((p) => {
+    const raw = toNumber(p.raw);
+    const moisture = toNumber(p.moisture);
+    return raw !== null && moisture !== null ? [{ raw, moisture }] : [];
+  });
+  const canCalculate = validPairs.length >= 3 && validPairs.length === pairs.length;
 
   const calculate = async () => {
     setResult(null);
@@ -72,7 +130,7 @@ export default function CalibracaoPage() {
       const res = await fetch("/api/calibration", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pointId: selectedPoint, pairs }),
+        body: JSON.stringify({ pointId: selectedPoint, pairs: validPairs }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -80,7 +138,7 @@ export default function CalibracaoPage() {
         return;
       }
       setResult(data);
-      setMessage({ type: "ok", text: `Calibração calculada: a = ${data.a.toFixed(6)}, b = ${data.b.toFixed(4)}, R² = ${data.r2.toFixed(6)}` });
+      setMessage({ type: "ok", text: `Calibração calculada: a = ${data.a.toFixed(6)}, b = ${data.b.toFixed(4)}, R² = ${data.r2.toFixed(4)}` });
     } catch {
       setMessage({ type: "err", text: "Erro de conexão." });
     }
@@ -88,9 +146,13 @@ export default function CalibracaoPage() {
 
   const apply = async () => {
     if (!result) return;
+    const weak = result.r2 < MIN_R2_TO_APPLY;
+    if (weak && !window.confirm(`O R² é só ${result.r2.toFixed(3)}. Aplicar esta calibração vai deixar as medições imprecisas. Aplicar mesmo assim?`)) {
+      return;
+    }
     setApplying(true);
     try {
-      const res = await fetch(`/api/calibration/${result.id}/apply`, { method: "POST" });
+      const res = await fetch(`/api/calibration/${result.id}/apply${weak ? "?force=1" : ""}`, { method: "POST" });
       if (res.ok) {
         setMessage({ type: "ok", text: `Calibração aplicada ao ponto ${selectedPoint}! O firmware receberá os novos coeficientes no próximo GET /api/config.` });
         setResult({ ...result, appliedAt: Date.now() });
@@ -106,18 +168,7 @@ export default function CalibracaoPage() {
   };
 
   // Dados para gráfico de dispersão + reta ajustada
-  const chartData = pairs.map((p) => ({ raw: p.raw, moisture: p.moisture }));
-  const lineData = result
-    ? (() => {
-        const raws = pairs.map((p) => p.raw);
-        const minR = Math.min(...raws) - 100;
-        const maxR = Math.max(...raws) + 100;
-        return [
-          { raw: minR, fit: result.a * minR + result.b },
-          { raw: maxR, fit: result.a * maxR + result.b },
-        ];
-      })()
-    : [];
+  const chart = validPairs.length > 0 ? buildChart(validPairs, result ? { a: result.a, b: result.b } : null) : null;
 
   return (
     <div>
@@ -154,7 +205,8 @@ export default function CalibracaoPage() {
             {pairs.map((p, i) => (
               <div key={i} className="flex gap-2 items-center">
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="decimal"
                   value={p.raw}
                   onChange={(e) => updatePair(i, "raw", e.target.value)}
                   placeholder="Leitura bruta"
@@ -163,8 +215,8 @@ export default function CalibracaoPage() {
                 />
                 <span className="text-slate-500">→</span>
                 <input
-                  type="number"
-                  step="0.1"
+                  type="text"
+                  inputMode="decimal"
                   value={p.moisture}
                   onChange={(e) => updatePair(i, "moisture", e.target.value)}
                   placeholder="Umidade %"
@@ -173,7 +225,7 @@ export default function CalibracaoPage() {
                 />
                 <span className="text-xs text-slate-500">%</span>
                 {pairs.length > 3 && (
-                  <button onClick={() => removePair(i)} className="text-red-400 hover:text-red-300 text-xs">
+                  <button onClick={() => removePair(i)} aria-label={`Remover par ${i + 1}`} className="text-red-400 hover:text-red-300 text-xs">
                     ✕
                   </button>
                 )}
@@ -193,7 +245,8 @@ export default function CalibracaoPage() {
           <div className="flex gap-3">
             <button
               onClick={calculate}
-              className="bg-accent hover:bg-accent-dark text-navy font-semibold px-5 py-2 rounded-lg text-sm transition-colors"
+              disabled={!canCalculate}
+              className="bg-accent hover:bg-accent-dark text-navy font-semibold px-5 py-2 rounded-lg text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Calcular Regressão
             </button>
@@ -203,10 +256,14 @@ export default function CalibracaoPage() {
                 disabled={applying}
                 className="border border-accent/50 text-accent hover:bg-accent/10 font-semibold px-5 py-2 rounded-lg text-sm transition-colors disabled:opacity-50"
               >
-                {applying ? "Aplicando…" : `Aplicar ao ${selectedPoint}`}
+                {applying ? "Aplicando…" : result.r2 < MIN_R2_TO_APPLY ? `Aplicar ao ${selectedPoint} mesmo assim` : `Aplicar ao ${selectedPoint}`}
               </button>
             )}
           </div>
+
+          {!canCalculate && (
+            <p className="text-xs text-amber-400 mt-3">Preencha ao menos 3 pares completos para calcular (todos os campos com número).</p>
+          )}
 
           {/* Mensagens */}
           {message && (
@@ -248,12 +305,12 @@ export default function CalibracaoPage() {
                 <div>
                   <div className="text-xs text-slate-400">R²</div>
                   <div className={`font-mono text-lg ${result.r2 >= 0.95 ? "text-accent" : "text-amber-400"}`}>
-                    {result.r2.toFixed(6)}
+                    {result.r2.toFixed(4)}
                   </div>
                 </div>
               </div>
               <p className="text-xs text-slate-500 mt-3 text-center">
-                umidade (%) = {result.a.toFixed(6)} × leitura_bruta + {result.b.toFixed(4)}
+                umidade (%) = {result.a.toFixed(6)} × leitura_bruta {fmtSigned(result.b, 4)}
               </p>
             </div>
           )}
@@ -271,14 +328,17 @@ export default function CalibracaoPage() {
                 <XAxis
                   dataKey="raw"
                   type="number"
-                  domain={["auto", "auto"]}
+                  domain={chart ? chart.xDomain : ["auto", "auto"]}
+                  allowDataOverflow
+                  height={48}
                   tick={{ fill: "#94a3b8", fontSize: 11 }}
-                  label={{ value: "Leitura bruta (ADC)", position: "bottom", fill: "#94a3b8", fontSize: 11 }}
+                  label={{ value: "Leitura bruta (ADC)", position: "insideBottom", offset: 0, fill: "#94a3b8", fontSize: 11 }}
                 />
                 <YAxis
                   dataKey="moisture"
                   type="number"
-                  domain={["auto", "auto"]}
+                  domain={chart ? chart.yDomain : [0, 10]}
+                  allowDataOverflow
                   tick={{ fill: "#94a3b8", fontSize: 11 }}
                   label={{ value: "Umidade (%)", angle: -90, position: "insideLeft", fill: "#94a3b8", fontSize: 11 }}
                 />
@@ -291,16 +351,17 @@ export default function CalibracaoPage() {
                     fontSize: 13,
                   }}
                 />
-                <Scatter data={chartData} fill="#22c55e" name="Pares" />
-                {result && lineData.length > 0 && (
+                <Scatter data={validPairs} fill="#22c55e" name="Pares" isAnimationActive={false} />
+                {result && chart && chart.line.length === 2 && (
                   <Line
-                    data={lineData}
+                    data={chart.line}
                     dataKey="fit"
                     stroke="#ef4444"
                     strokeWidth={2}
                     dot={false}
                     name="Reta ajustada"
                     legendType="line"
+                    isAnimationActive={false}
                   />
                 )}
               </ComposedChart>
@@ -308,7 +369,7 @@ export default function CalibracaoPage() {
           </div>
           {result && (
             <p className="text-center text-xs text-slate-500 mt-2">
-              y = {result.a.toFixed(6)}x + {result.b.toFixed(4)} · R² = {result.r2.toFixed(6)} · {result.n} pares
+              {equation(result.a, result.b)} · R² = {result.r2.toFixed(4)} · {result.n} pares
             </p>
           )}
         </div>

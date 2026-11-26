@@ -82,3 +82,15 @@ test("rejeita menos de 3 pares, leituras iguais e umidades iguais", () => {
 test("applyLinear usa a mesma conta do firmware", () => {
   close(applyLinear(-0.005, 20, 2200), 9);
 });
+
+test("dados do print do TCC (2810 → 64 %): inclinação positiva e R² baixo geram avisos", () => {
+  const fit = fitLinear([
+    { raw: 2000, moisture: 10 },
+    { raw: 2410, moisture: 8 },
+    { raw: 2810, moisture: 64 },
+  ]);
+  assert.ok(fit.a > 0);
+  assert.ok(fit.r2 < 0.95);
+  assert.ok(fit.warnings.some((w) => w.includes("Inclinação positiva")));
+  assert.ok(fit.warnings.some((w) => w.includes("R² baixo")));
+});

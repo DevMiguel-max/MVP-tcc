@@ -9,7 +9,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 export function usePolling<T>(url: string, intervalMs = 2000) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const fetchData = useCallback(async () => {
     try {
@@ -29,7 +29,9 @@ export function usePolling<T>(url: string, intervalMs = 2000) {
     const tick = async () => {
       if (!running) return;
       await fetchData();
-      if (running) {
+      // Aba oculta: não agenda a próxima rodada (o evento de visibilidade retoma o ciclo).
+      if (running && !document.hidden) {
+        clearTimeout(timeoutRef.current);
         timeoutRef.current = setTimeout(tick, intervalMs);
       }
     };
@@ -40,6 +42,7 @@ export function usePolling<T>(url: string, intervalMs = 2000) {
       if (document.hidden) {
         clearTimeout(timeoutRef.current);
       } else {
+        clearTimeout(timeoutRef.current);
         tick();
       }
     };

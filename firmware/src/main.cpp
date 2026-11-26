@@ -8,6 +8,8 @@
  */
 
 #include <Arduino.h>
+#include <time.h>
+#include <sys/time.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -42,7 +44,7 @@ struct QueuedReading {
   float raw;
   float tempC;
   float moisture;
-  unsigned long ts;
+  uint64_t ts;   // epoch em ms: precisa de 64 bits (unsigned long tem 32 bits no ESP32)
   bool valid;
 };
 QueuedReading offlineQueue[QUEUE_MAX_SIZE];
@@ -50,6 +52,8 @@ int queueHead = 0;
 int queueCount = 0;
 
 unsigned long lastSendMs = 0;
+unsigned long lastWifiAttemptMs = 0;
+const unsigned long WIFI_RETRY_INTERVAL = 10000; // tenta reconectar a cada 10 s sem travar as leituras
 unsigned long lastConfigFetchMs = 0;
 const unsigned long CONFIG_FETCH_INTERVAL = 60000; // busca config a cada 60 s
 
@@ -127,7 +131,7 @@ void connectWiFi() {
 
 // ── Fila offline ─────────────────────────────────────────────
 
-void enqueue(float raw, float tempC, float moisture, unsigned long ts) {
+void enqueue(float raw, float tempC, float moisture, uint64_t ts) {
   if (queueCount >= QUEUE_MAX_SIZE) {
     Serial.println("[fila] Cheia — descartando a mais antiga.");
     queueHead = (queueHead + 1) % QUEUE_MAX_SIZE;
@@ -152,12 +156,14 @@ bool dequeue(QueuedReading &out) {
 /**
  * Envia uma leitura ao backend. Retorna true se HTTP 2xx.
  */
-bool sendReading(float raw, float tempC, float moisture, unsigned long ts) {
+bool sendReading(float raw, float tempC, float moisture, uint64_t ts) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/readings";
   http.begin(url);
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-api-key", API_KEY);
 
@@ -195,6 +201,8 @@ void fetchConfig() {
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/config/" + DEVICE_ID;
   http.begin(url);
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
   http.addHeader("x-api-key", API_KEY);
 
   int code = http.GET();
@@ -247,6 +255,9 @@ void setup() {
   // Wi-Fi
   connectWiFi();
 
+  // Relógio (NTP): sem isso o timestamp das leituras seria inválido (o servidor usaria o próprio horário).
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+
   // Buscar config na inicialização
   fetchConfig();
 }
@@ -254,9 +265,13 @@ void setup() {
 // ── Loop ─────────────────────────────────────────────────────
 
 void loop() {
-  connectWiFi();
-
   unsigned long now = millis();
+
+  // Reconexão não bloqueante: se o Wi-Fi cair, as leituras continuam e vão para a fila.
+  if (WiFi.status() != WL_CONNECTED && now - lastWifiAttemptMs >= WIFI_RETRY_INTERVAL) {
+    lastWifiAttemptMs = now;
+    connectWiFi();
+  }
 
   // Busca config periodicamente
   if (now - lastConfigFetchMs >= CONFIG_FETCH_INTERVAL) {
@@ -281,11 +296,12 @@ void loop() {
     // 4. Temperatura
     float tempC = readTemperature();
 
-    // 5. Timestamp (epoch ms — requer NTP; se Wi-Fi conectado, configTime já fez)
+    // 5. Timestamp em epoch ms (64 bits). Sem NTP sincronizado envia 0 e o servidor usa o próprio horário.
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    unsigned long tsMs = (unsigned long)(tv.tv_sec) * 1000UL + (unsigned long)(tv.tv_usec / 1000);
-    // Se o relógio não foi sincronizado, tsMs será baixo; o servidor corrige.
+    uint64_t tsMs = (tv.tv_sec > 1700000000L)
+                        ? (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000)
+                        : 0ULL;
 
     Serial.printf("[leitura] raw=%.1f filtrada=%.1f moisture=%.2f%% temp=%.1f°C\n",
                   rawMedian, rawFiltered, moisture, tempC);
@@ -296,14 +312,15 @@ void loop() {
       Serial.printf("[fila] Enfileirada (%d na fila).\n", queueCount);
     }
 
-    // 7. Tentar reenviar a fila
-    QueuedReading queued;
-    while (dequeue(queued)) {
-      if (!sendReading(queued.raw, queued.tempC, queued.moisture, queued.ts)) {
-        // Falhou de novo — recoloca na fila e para de tentar
-        enqueue(queued.raw, queued.tempC, queued.moisture, queued.ts);
-        break;
-      }
+    // 7. Reenviar a fila em ordem (no máximo 5 por ciclo, para não travar as leituras).
+    //    Só remove da fila quando o envio dá certo, assim a ordem original é preservada.
+    int resent = 0;
+    while (queueCount > 0 && resent < 5) {
+      QueuedReading &q = offlineQueue[queueHead];
+      if (!sendReading(q.raw, q.tempC, q.moisture, q.ts)) break;
+      QueuedReading discard;
+      dequeue(discard);
+      resent++;
     }
   }
 

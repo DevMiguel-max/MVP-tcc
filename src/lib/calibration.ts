@@ -68,6 +68,11 @@ export function fitLinear(pairs: CalibrationPair[]): CalibrationFit {
   if (r2 < 0.95) {
     warnings.push(`R² baixo (${r2.toFixed(3)}): o ajuste linear está fraco. Revise as amostras ou refaça as leituras.`);
   }
+  if (a >= 0) {
+    warnings.push(
+      "Inclinação positiva: em sensor capacitivo, quanto mais úmido o material, MENOR a leitura (ADC). Confira se as leituras e as umidades não foram trocadas ou digitadas errado.",
+    );
+  }
   if (n < 5) {
     warnings.push(`Apenas ${n} pares: a calibração é frágil. Use 5 ou mais pontos distribuídos na faixa de operação.`);
   }

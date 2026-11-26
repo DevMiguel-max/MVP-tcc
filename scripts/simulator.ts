@@ -39,6 +39,19 @@ db.close();
 
 const BASE_URL = process.env.OREMETRIX_URL ?? "http://localhost:3000";
 
+/** Usa a calibração vigente de cada ponto (se o servidor estiver no ar), para o simulador ficar coerente com o painel. */
+async function fetchCalibration(deviceId: string): Promise<{ a: number; b: number } | null> {
+  try {
+    const res = await fetch(`${BASE_URL}/api/config/${deviceId}`, { headers: { "x-api-key": apiKey } });
+    if (!res.ok) return null;
+    const cfg = (await res.json()) as { a: number; b: number };
+    // Só aceita inclinação negativa (sensor capacitivo); com outra, a simulação não faria sentido.
+    return Number.isFinite(cfg.a) && Number.isFinite(cfg.b) && cfg.a < 0 ? { a: cfg.a, b: cfg.b } : null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Modelos de cada ponto ────────────────────────────────────────────────────
 
 interface PointSim {
@@ -52,6 +65,10 @@ interface PointSim {
   /** Estado mutável */
   raw: number;
   tempC: number;
+  /** ponto "deriva": true enquanto a umidade está subindo; false enquanto desce */
+  rising: boolean;
+  /** leitura central dos pontos "estável" e "ruidoso" (o ruído oscila em torno dela, sem se acumular) */
+  base: number;
 }
 
 function rawFromMoisture(a: number, b: number, m: number): number {
@@ -59,7 +76,7 @@ function rawFromMoisture(a: number, b: number, m: number): number {
   return (m - b) / a;
 }
 
-const calA = -0.005;
+const calA = -0.005; // calibração padrão (a mesma do primeiro boot); é substituída pela vigente ao iniciar
 const calB = 20;
 
 const points: PointSim[] = [
@@ -71,6 +88,8 @@ const points: PointSim[] = [
     calB,
     raw: rawFromMoisture(calA, calB, 7.0),
     tempC: 28,
+    rising: true,
+    base: 0,
   },
   {
     pointId: "P-03",
@@ -80,6 +99,8 @@ const points: PointSim[] = [
     calB,
     raw: rawFromMoisture(calA, calB, scenario === "alert" ? 8.0 : 6.5),
     tempC: 30,
+    rising: true,
+    base: 0,
   },
   {
     pointId: "C-01",
@@ -89,6 +110,8 @@ const points: PointSim[] = [
     calB,
     raw: rawFromMoisture(calA, calB, 8.0),
     tempC: 26,
+    rising: true,
+    base: 0,
   },
 ];
 
@@ -106,34 +129,31 @@ function clamp(v: number, lo: number, hi: number): number {
 }
 
 /** Atualiza o raw do ponto e devolve { raw, moisture, tempC }. */
-function step(p: PointSim, tick: number): { raw: number; moisture: number; tempC: number } {
+function step(p: PointSim): { raw: number; moisture: number; tempC: number } {
   const driftRate = scenario === "alert" ? 0.15 : 0.04; // %/tick
 
   switch (p.label) {
     case "estável":
-      // Oscila em torno de 7 %: ruído ±0.3 %
-      p.raw += gauss() * (0.3 / Math.abs(p.calA));
+      // Oscila em torno de 7 %: ruído ±0,3 % (em torno da base, sem deriva acumulada)
+      p.raw = p.base + gauss() * (0.3 / Math.abs(p.calA));
       break;
 
     case "deriva":
-      // Sobe lentamente (cada tick sobe ~driftRate %); depois de estourar, desce
+      // Ciclo: sobe até ~11 % (cruza o limite e abre o alerta), depois desce até ~6,5 % (o alerta fecha) e recomeça.
       {
         const moistureNow = p.calA * p.raw + p.calB;
-        if (moistureNow < 11) {
-          // subindo
-          p.raw -= driftRate / Math.abs(p.calA); // raw diminui → moisture sobe (calA negativo)
-        } else {
-          // volta para baixo do limite para mostrar o resolve do alerta
-          p.raw += 0.3 / Math.abs(p.calA);
-        }
-        // ruído leve
-        p.raw += gauss() * (0.08 / Math.abs(p.calA));
+        if (p.rising && moistureNow >= 11) p.rising = false;
+        else if (!p.rising && moistureNow <= 6.5) p.rising = true;
+
+        const stepPct = p.rising ? driftRate : -0.3;
+        p.raw -= stepPct / Math.abs(p.calA); // calA < 0: raw menor → umidade maior
+        p.raw += gauss() * (0.08 / Math.abs(p.calA)); // ruído leve
       }
       break;
 
     case "ruidoso":
-      // Ruído alto ±1.5 %
-      p.raw += gauss() * (1.5 / Math.abs(p.calA));
+      // Ruído alto ±1,5 % em torno de 8 % (antes o ruído se acumulava e a umidade fugia para 17 %)
+      p.raw = p.base + gauss() * (1.5 / Math.abs(p.calA));
       break;
   }
 
@@ -198,17 +218,29 @@ console.log(`
 ╚══════════════════════════════════════════════════════════════╝
 `);
 
-let tick = 0;
 async function loop() {
   for (const p of points) {
-    const data = step(p, tick);
+    const data = step(p);
     await sendReading(p, data);
   }
-  tick++;
+}
+
+// Carrega a calibração vigente de cada ponto e só então começa a enviar.
+async function init() {
+  for (const p of points) {
+    const cal = await fetchCalibration(p.deviceId);
+    if (cal) {
+      const moistureNow = p.calA * p.raw + p.calB; // mantém a umidade inicial planejada
+      p.calA = cal.a;
+      p.calB = cal.b;
+      p.raw = rawFromMoisture(cal.a, cal.b, moistureNow);
+    }
+    p.base = p.raw;
+  }
 }
 
 // Primeira iteração imediata
-loop().then(() => {
+init().then(loop).then(() => {
   const timer = setInterval(() => {
     loop().catch((err) => console.error("[sim] erro no loop:", err));
   }, interval);
