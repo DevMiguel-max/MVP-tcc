@@ -1,3 +1,6 @@
+<p align="center">
+  <a href="https://feitonobrasil.dev.br"><img src="https://selo.feitonobrasil.dev.br/pt-br/colorido/1x.svg" alt="Feito no Brasil" height="56"></a>
+</p>
 # OREMETRIX
 
 Protótipo de **medição online da umidade de minério de ferro** para TCC do SENAI (demanda da Vale S/A).
